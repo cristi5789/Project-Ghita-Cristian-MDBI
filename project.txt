@@ -1,0 +1,369 @@
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import Anthropic from '@anthropic-ai/sdk';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+dotenv.config();
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const app = express();
+const PORT = process.env.PORT || 3001;
+const MODEL = 'claude-sonnet-4-20250514';
+
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.error('❌  ANTHROPIC_API_KEY missing — copy .env.example to .env and add your key.');
+  process.exit(1);
+}
+
+const ai = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:4173'] }));
+app.use(express.json());
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function parseJSON(text) {
+  const cleaned = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+  return JSON.parse(cleaned);
+}
+
+async function chat(system, userContent, maxTokens = 1024) {
+  const params = {
+    model: MODEL,
+    max_tokens: maxTokens,
+    messages: [{ role: 'user', content: userContent }],
+  };
+  if (system) params.system = system;
+  const res = await ai.messages.create(params);
+  return res.content[0].text;
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/ai/create-character
+ * Generates backstory, traits, opening scene, starting items, and special ability.
+ */
+app.post('/api/ai/create-character', async (req, res) => {
+  const { name, race, characterClass, background, stats } = req.body;
+  try {
+    const text = await chat(
+      null,
+      `You are a master fantasy RPG storyteller creating a vivid, unique character.
+Character:
+- Name: ${name}
+- Race: ${race}
+- Class: ${characterClass}
+- Background: ${background}
+- Stats: STR ${stats.strength} | INT ${stats.intelligence} | DEX ${stats.dexterity} | CHA ${stats.charisma} | WIS ${stats.wisdom}
+
+Return ONLY valid JSON (no markdown, no preamble):
+{
+  "backstory": "3-4 sentences of compelling, specific backstory that references their race, class, and background",
+  "personalityTraits": ["trait1", "trait2", "trait3"],
+  "motivation": "one sentence — what drives this character more than anything",
+  "flaw": "one specific character flaw",
+  "startingLocation": "name of a unique starting town or area (be creative)",
+  "openingNarrative": "3 sentences that drop the player into the opening scene — second person, present tense, vivid sensory detail",
+  "startingItems": [
+    { "name": "item1", "description": "short flavor text", "type": "weapon|armor|consumable|misc" },
+    { "name": "item2", "description": "short flavor text", "type": "weapon|armor|consumable|misc" },
+    { "name": "item3", "description": "short flavor text", "type": "weapon|armor|consumable|misc" }
+  ],
+  "specialAbility": { "name": "unique ability name", "description": "what it does in 1 sentence" }
+}`,
+      1200
+    );
+    res.json(parseJSON(text));
+  } catch (err) {
+    console.error('/create-character error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/ai/story-action
+ * The core game loop — processes a player action and returns narrative + choices.
+ */
+app.post('/api/ai/story-action', async (req, res) => {
+  const { character, world, storyMemory, playerAction } = req.body;
+  try {
+    const text = await chat(
+      `You are a creative, consequence-driven fantasy RPG Game Master. You ALWAYS remember and reference past events.
+Character: ${character.name} the ${character.race} ${character.characterClass} (${character.background} background)
+Level ${character.level} | HP ${character.hp}/${character.maxHp} | Gold ${character.gold}
+Special ability: ${character.specialAbility?.name}
+Personality: ${character.personalityTraits?.join(', ')}
+Key story memories: ${storyMemory.slice(-8).join(' | ')}
+Current location: ${world.currentLocation}`,
+      `Player action: "${playerAction}"
+
+The world reacts. Make it feel alive, surprising, and consequential. Reference past events naturally.
+Return ONLY valid JSON:
+{
+  "narrative": "3-5 sentences of vivid, immersive narrative in second person present tense. Use sensory details.",
+  "choices": ["specific choice 1", "specific choice 2", "specific choice 3", "specific choice 4"],
+  "encounter": null,
+  "hpChange": 0,
+  "goldChange": 0,
+  "newItem": null,
+  "memoryNote": "null or a brief note of what just happened (stored for future reference)",
+  "locationChanged": null,
+  "xpGain": 5
+}
+For encounter, use: { "type": "combat"|"npc"|"item_discovery", "name": "...", "description": "...", "personality": "..." } or null.
+Make combat and NPC encounters feel earned, not random. Only trigger them ~30% of actions.`,
+      1400
+    );
+    res.json(parseJSON(text));
+  } catch (err) {
+    console.error('/story-action error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/ai/combat-round
+ * Handles a single round of combat with stat-based math + narrative flair.
+ */
+app.post('/api/ai/combat-round', async (req, res) => {
+  const { character, enemy, playerAction, round, combatLog } = req.body;
+  try {
+    const text = await chat(
+      null,
+      `Fantasy RPG Combat — Round ${round}
+Player: ${character.name} | Class: ${character.characterClass} | HP: ${character.hp}/${character.maxHp}
+Stats: STR ${character.stats.strength} INT ${character.stats.intelligence} DEX ${character.stats.dexterity}
+Special ability: ${character.specialAbility?.name} — ${character.specialAbility?.description}
+Enemy: ${enemy.name} (Level ${enemy.level}) | HP: ${enemy.hp}/${enemy.maxHp} | Traits: ${enemy.traits}
+Player action: "${playerAction}"
+Combat history: ${combatLog.slice(-3).join(' | ')}
+
+Calculate damage realistically based on stats and action. High STR = more physical damage. High DEX = dodge chance.
+Using the special ability should do extra damage but cost some resource. 
+Return ONLY valid JSON:
+{
+  "narrative": "3 sentences of cinematic combat description — be specific about the action, what hit, what the enemy did",
+  "playerDamageDealt": number (5–35 range based on action quality and stats),
+  "enemyDamageDealt": number (3–20 range, consider player DEX for dodge),
+  "isCritical": boolean,
+  "isDodged": boolean,
+  "combatStatus": "ongoing"|"victory"|"defeat"|"fled",
+  "xpReward": number (20–80 depending on enemy level, only set if victory),
+  "goldReward": number (only if victory),
+  "itemDrop": null or "specific item name with brief description",
+  "enemyNextMove": "what the enemy is preparing to do next round"
+}`,
+      900
+    );
+    res.json(parseJSON(text));
+  } catch (err) {
+    console.error('/combat-round error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/ai/generate-enemy
+ * Creates a unique enemy when combat is triggered.
+ */
+app.post('/api/ai/generate-enemy', async (req, res) => {
+  const { encounterName, encounterDescription, characterLevel } = req.body;
+  try {
+    const text = await chat(
+      null,
+      `Generate a unique fantasy RPG enemy for a level ${characterLevel} encounter.
+Encounter hint: ${encounterName} — ${encounterDescription}
+Return ONLY valid JSON:
+{
+  "name": "specific enemy name",
+  "title": "optional title (e.g. 'The Undying', 'Blade of Storms')",
+  "description": "2 sentences of appearance and aura",
+  "traits": "3 combat traits (e.g. fast, venomous, armored)",
+  "level": ${Math.max(1, characterLevel - 1 + Math.floor(Math.random() * 3))},
+  "maxHp": number (40–120 based on level),
+  "attackStyle": "how this enemy fights",
+  "weakness": "one specific weakness the player might discover",
+  "lore": "one sentence of lore"
+}`,
+      700
+    );
+    res.json(parseJSON(text));
+  } catch (err) {
+    console.error('/generate-enemy error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/ai/npc-dialog
+ * Full NPC conversation with persistent memory.
+ */
+app.post('/api/ai/npc-dialog', async (req, res) => {
+  const { npc, character, playerMessage, conversationHistory } = req.body;
+  try {
+    const messages = [
+      ...conversationHistory.map(h => ({ role: h.role, content: h.content })),
+      { role: 'user', content: playerMessage }
+    ];
+    const params = {
+      model: MODEL,
+      max_tokens: 500,
+      system: `You are ${npc.name}${npc.title ? ` "${npc.title}"` : ''} — ${npc.description}
+Personality: ${npc.personality}
+You are speaking to ${character.name}, a ${character.race} ${character.characterClass}.
+Stay completely in character at all times. Keep responses to 2-3 sentences.
+You may offer quests, sell items, share rumors, or react with hostility based on personality.
+Never break the fourth wall. Never acknowledge you are an AI.`,
+      messages
+    };
+    const aiRes = await ai.messages.create(params);
+    res.json({
+      response: aiRes.content[0].text,
+      npcName: npc.name
+    });
+  } catch (err) {
+    console.error('/npc-dialog error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/ai/generate-npc
+ * Creates a unique NPC from an encounter trigger.
+ */
+app.post('/api/ai/generate-npc', async (req, res) => {
+  const { encounterName, encounterDescription, location, character } = req.body;
+  try {
+    const text = await chat(
+      null,
+      `Generate a memorable fantasy RPG NPC the player just met.
+Context: ${encounterName} — ${encounterDescription}
+Location: ${location}
+Player: ${character.race} ${character.characterClass}
+Return ONLY valid JSON:
+{
+  "name": "NPC full name",
+  "title": "optional title or epithet",
+  "race": "fantasy race",
+  "occupation": "specific occupation",
+  "description": "2 sentences of appearance (vivid, specific)",
+  "personality": "3 personality traits that affect how they speak and act",
+  "motivation": "what they want right now",
+  "knowledge": "2-3 things they know about the world, rumors, or quests",
+  "attitude": "friendly|neutral|suspicious|hostile",
+  "openingLine": "exactly what they say when they meet the player"
+}`,
+      700
+    );
+    res.json(parseJSON(text));
+  } catch (err) {
+    console.error('/generate-npc error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/ai/generate-location
+ * Describes a new location as the player travels.
+ */
+app.post('/api/ai/generate-location', async (req, res) => {
+  const { locationName, previousLocations, character } = req.body;
+  try {
+    const text = await chat(
+      null,
+      `Create a vivid fantasy RPG location description.
+Location: "${locationName}"
+Previously visited: ${previousLocations.join(', ')}
+Character: ${character.race} ${character.characterClass} named ${character.name}
+Return ONLY valid JSON:
+{
+  "fullDescription": "4 sentences — atmosphere, sights, sounds, smells. Make it feel truly alive.",
+  "mood": "one word mood (e.g. foreboding, bustling, serene, chaotic)",
+  "pointsOfInterest": ["specific POI 1", "specific POI 2", "specific POI 3"],
+  "hiddenSecret": "one hidden secret or discoverable thing",
+  "ambience": "one unique recurring sensory detail (sound, smell, or sight)",
+  "dangerLevel": "safe|low|medium|high|deadly"
+}`,
+      700
+    );
+    res.json(parseJSON(text));
+  } catch (err) {
+    console.error('/generate-location error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/ai/forge-item
+ * Generates a unique item with lore and stats.
+ */
+app.post('/api/ai/forge-item', async (req, res) => {
+  const { character, context, rarity } = req.body;
+  try {
+    const text = await chat(
+      null,
+      `Forge a unique fantasy RPG item.
+Player: Level ${character.level} ${character.race} ${character.characterClass}
+Context: ${context}
+Rarity: ${rarity || 'uncommon'}
+Return ONLY valid JSON:
+{
+  "name": "evocative item name",
+  "type": "weapon|armor|ring|amulet|potion|scroll|misc",
+  "rarity": "${rarity || 'uncommon'}",
+  "description": "2 sentences — appearance and a hint of its history",
+  "effect": "specific game mechanical benefit",
+  "lore": "one sentence of in-world lore or legend about this item",
+  "value": number
+}`,
+      600
+    );
+    res.json(parseJSON(text));
+  } catch (err) {
+    console.error('/forge-item error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/ai/level-up-narrative
+ * Generates a narrative moment when the player levels up.
+ */
+app.post('/api/ai/level-up-narrative', async (req, res) => {
+  const { character, newLevel, recentMemories } = req.body;
+  try {
+    const text = await chat(
+      null,
+      `Generate a powerful level-up moment for a fantasy RPG character.
+Character: ${character.name} the ${character.race} ${character.characterClass}
+Reaching level: ${newLevel}
+Their journey so far: ${recentMemories.join(', ')}
+Return ONLY valid JSON:
+{
+  "narrative": "3 sentences — a vivid internal moment of growth, power awakening, or insight. Second person.",
+  "newPowerDescription": "what new strength or ability stirs within them",
+  "statBoosts": { "hp": 10, "strength": 1, "intelligence": 1, "dexterity": 1, "charisma": 1, "wisdom": 1 },
+  "inspirationalLine": "one short, memorable line the character could say to themselves"
+}`,
+      600
+    );
+    res.json(parseJSON(text));
+  } catch (err) {
+    console.error('/level-up error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Serve built frontend in production ───────────────────────────────────────
+if (process.env.NODE_ENV === 'production') {
+  const clientDist = join(__dirname, '../client/dist');
+  app.use(express.static(clientDist));
+  app.get('*', (_, res) => res.sendFile(join(clientDist, 'index.html')));
+}
+
+app.listen(PORT, () => {
+  console.log(`⚔️  NeuralQuest backend running → http://localhost:${PORT}`);
+  console.log(`🤖  Using Claude ${MODEL}`);
+});
